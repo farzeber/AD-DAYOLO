@@ -1,0 +1,554 @@
+#!/usr/bin/python3
+import argparse
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from torch.autograd import Variable
+import torch
+import utility
+from torch import nn
+import os, time
+import torch.optim as optim
+from model.DRN import DRN_x8 as DRN
+from classificationnet import vgg_drnvgg9_2 as vgg
+#from classificationnet import vggbn_drnvgg as vggbn
+from classificationnet import vggbn_drnvgg1 as vggbn
+from shutil import copy
+import shutil
+from model.common1 import DownBlock
+import numpy as np
+from utils.MyImageFolder1 import process
+from tensorboardX import SummaryWriter
+from PIL import Image
+import random
+from utils.utils import *
+from utils.utils import PR_IMAGE
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+# 设置随机数种子
+setup_seed(20)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--scale', type=int, default=8,
+                    help='super resolution scale')
+
+parser.add_argument('--lr', type=float, default=1e-4,
+                    help='learning rate')
+parser.add_argument('--eta_min', type=float, default=1e-7,
+                    help='eta_min lr')
+parser.add_argument('--beta1', type=float, default=0.9,
+                    help='ADAM beta1')
+parser.add_argument('--beta2', type=float, default=0.999,
+                    help='ADAM beta2')
+parser.add_argument('--epsilon', type=float, default=1e-8,
+                    help='ADAM epsilon for numerical stability')
+parser.add_argument('--weight_decay', type=float, default=0,
+                    help='weight decay')
+
+parser.add_argument('--skip_threshold', type=float, default='1e6',
+                    help='skipping batch that has large error')
+parser.add_argument('--dual_weight', type=float, default=0.1,
+                    help='the weight of dual loss')
+parser.add_argument('--epochs', type=int, default=120, help='starting epoch')
+parser.add_argument('--model', type=str, default='vgg16_bn', help='vgg16  or  vgg16_bn ')
+parser.add_argument('--epoch', type=int, default=0, help='starting epoch')
+parser.add_argument('--checkpoint', type=str, default='./model', help='save model root')
+parser.add_argument('--name', type=str, default='drn_vgg9', help='train name')
+parser.add_argument('--n_epochs', type=int, default=120, help='number of epochs of training')
+parser.add_argument('--batchSize', type=int, default=8, help='size of the batches')
+parser.add_argument('--dataset', type=str,
+                    default='dog',
+                    help='root directory of the dataset')
+parser.add_argument('--slr', type=float, default=0.0001, help='initial sr learning rate')
+
+opt = parser.parse_args()
+opt.scale = [pow(2, s+1) for s in range(int(np.log2(opt.scale)))]
+
+save = 'checkpoint' + "/" + opt.name + "/" + time.strftime("%Y-%m-%d-%H:%M:%S")
+os.makedirs(save)
+copy('drn_vgg9_x8.py', save)
+copy('classificationnet.py', save)
+
+copy('model/DRN.py', save)
+print(opt)
+writer = SummaryWriter(save + '/runs/'+opt.name)
+
+T = 'delete_next'
+if os.path.isdir(T) != 1:
+    os.makedirs(T)
+logger = Logger(os.path.join(save, 'result.csv'), title=opt.dataset)
+logger.set_names(
+     [' epoch', 'train_hr_Top1', 'train_sr_Top1','test_hr_Top1','test_hr_Top5'])
+
+
+# get data root path
+data_root = os.path.abspath(os.path.join(os.getcwd(), "../deep-learning-for-image-processing-master"))
+if opt.dataset == "cub":
+    image_path = data_root + "/data_set/CUB2001/"
+    opt.num_classes = 200
+    if opt.model=='vgg16':
+        classifmodel=vgg(num_classes= opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/APEN-master/premodel/cubhr/best_vgg16cl.pth.tar"
+    elif opt.model=='vgg16_bn':
+        classifmodel = vggbn(num_classes=opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/APEN-master/premodel/cubhr_vggbn/best_vgg16cl.pth.tar"
+
+elif opt.dataset == "flower":
+    image_path = data_root + "/data_set/flower_data/"  # flower data set path
+    opt.num_classes = 5
+    model_weight_path ="/media/liu/Ubuntu/APEN-master/checkpoint/vgg162021-04-21-20:47:31/best_vgg16cl.pth.tar"
+
+elif opt.dataset == "caltech":
+    image_path = data_root + "/data_set/caltech/"  # flower data set path
+    opt.num_classes = 257
+    if opt.model=='vgg16':
+        classifmodel=vgg(num_classes= opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/APEN-master/premodel/caltechhr/best_vgg16cl.pth.tar"
+    elif opt.model=='vgg16_bn':
+        classifmodel = vggbn(num_classes=opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/ours/pre_model/caltech_vgg16bn/best_vgg16bncl.pth"
+
+elif opt.dataset == "dog":
+    image_path = data_root + "/data_set/dog/"  # flower data set path
+    opt.num_classes = 120
+    if opt.model=='vgg16':
+        classifmodel=vgg(num_classes= opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/APEN-master/premodel/doghr/best_vgg16cl.pth.tar"
+    elif opt.model=='vgg16_bn':
+        classifmodel = vggbn(num_classes=opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/APEN-master/premodel/doghr_vggbn/best_vgg16cl.pth.tar"
+
+
+elif opt.dataset == "car":
+    image_path = data_root + "/data_set/car/"  # flower data set path
+    opt.num_classes = 196
+    if opt.model=='vgg16':
+        classifmodel=vgg(num_classes= opt.num_classes)
+        model_weight_path ="/public/home/jd_changkan/lzq/APEN-master/premodel/carhr/best_vgg16cl.pth"
+    elif opt.model=='vgg16_bn':
+        classifmodel = vggbn(num_classes=opt.num_classes)
+        model_weight_path ="/public/home/jd_lzq/classification/APEN-master/checkpoint/vgg16/2021-12-03-15:34:31/best_vgg16cl.pth"
+
+def AdjustLearningRate(optimizer, epoch, learning_rate):
+    lr = learning_rate * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return optimizer
+
+
+###### Definition of variables ######
+# Networks
+srmodel=DRN()
+if torch.cuda.is_available():
+    srmodel.cuda()
+    classifmodel.cuda()
+
+dual_models = []
+for _ in opt.scale:
+    dual_model = DownBlock(2).cuda()
+    dual_models.append(dual_model)
+
+state_dict= torch.load(model_weight_path,map_location=lambda storage, loc: storage)
+classifmodel.load_state_dict(state_dict)
+
+# compute parameter
+print(' srmodel parameters:', sum(param.numel() for param in srmodel.parameters()))
+print(' classifmodel parameters:', sum(para.numel() for para in classifmodel.parameters()))
+print(' dual parameters:', sum(para.numel() for para in dual_model.parameters()))
+
+# Lossess
+loss_function = torch.nn.L1Loss(reduction='mean')
+criterion_G = torch.nn.MSELoss()
+criterion_class = torch.nn.CrossEntropyLoss()
+
+# Optimizers & LR schedulers
+sroptimizer = optim.Adam(srmodel.parameters(), lr=opt.slr, betas=(0.9, 0.999), eps=1e-8,
+                           weight_decay=opt.weight_decay)
+
+### data processing
+transform_train1 = transforms.Compose(
+        [
+             transforms.Resize(256, interpolation=Image.BICUBIC),
+             transforms.RandomCrop(224),
+             transforms.RandomHorizontalFlip(),
+        ])
+transform_train2 = transforms.Compose(
+        [
+             transforms.ToTensor(),
+             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+transform_train3 = transforms.Compose(
+        [
+            transforms.Resize(112, interpolation=Image.BICUBIC),
+        ])
+transform_train4 = transforms.Compose(
+        [
+            transforms.Resize(56, interpolation=Image.BICUBIC),
+        ])
+transform_train5 = transforms.Compose(
+        [
+            transforms.Resize(28, interpolation=Image.BICUBIC),
+        ])
+
+transform_test1 = transforms.Compose(
+        [
+             transforms.Resize(256, interpolation=Image.BICUBIC),
+             transforms.CenterCrop(224),
+        ])
+transform_test2 = transforms.Compose(
+        [
+             transforms.ToTensor(),
+             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+transform_test3 = transforms.Compose(
+        [
+             transforms.Resize(112, interpolation=Image.BICUBIC),
+        ])
+transform_test4 = transforms.Compose(
+        [
+             transforms.Resize(56, interpolation=Image.BICUBIC),
+        ])
+transform_test5 = transforms.Compose(
+        [
+             transforms.Resize(28, interpolation=Image.BICUBIC),
+        ])
+
+train_path=os.path.join(image_path, 'train')
+test_path=os.path.join(image_path, 'val')
+trainset = process(train_path, transform=transform_train1, transform1=transform_train2, transform2=transform_train3, transform3=transform_train4, transform4=transform_train5, label=3)
+train_loader = DataLoader(trainset, batch_size=opt.batchSize, shuffle=True)
+
+up = transforms.Compose(
+        [
+             transforms.ToPILImage(),
+             transforms.Resize(224, interpolation=Image.BICUBIC),
+             transforms.ToTensor(),
+             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+
+testset = process(test_path, transform=transform_test1, transform1=transform_test2, transform2=transform_test3, transform3=transform_test4, transform4=transform_test5, label=3)
+test_loader = DataLoader(testset, batch_size=opt.batchSize, shuffle=False)
+best_acc=0
+
+def test(epoch, acc_list):
+    srmodel.eval()
+    classifmodel.eval()
+
+    test_loss = 0
+    top1 = 0
+    top5 = 0
+    top1sr = 0
+    top5sr = 0
+    score_list = []  # 存储预测得分
+    label_list = []  # 存储真实标签
+    tp = np.zeros([opt.num_classes], dtype=int)    ####    混淆矩阵
+    fp = np.zeros([opt.num_classes], dtype=int)    ####    tp  fn
+    tn = np.zeros([opt.num_classes], dtype=int)    ####    fp  tn
+    fn = np.zeros([opt.num_classes], dtype=int)
+    print(time.strftime("%Y-%m-%d-%H:%M:%S"))
+    for iter, testdata in enumerate(test_loader):
+        ###### 删除T换任务
+        if os.path.isdir(T)!= 1:
+            break
+        imhr, imlr_112, imlr_56, imlr_28, targets = testdata
+        imhr, imlr_112, imlr_56, imlr_28, targets = imhr.cuda(), imlr_112.cuda(), imlr_56.cuda(), imlr_28.cuda(), targets.cuda()
+        imsr = srmodel(imlr_28)
+
+        outputshr, _, _, _ = classifmodel(x=imhr,y=2)
+        outputssr, _, _, _ = classifmodel(x=imsr[-1],y=2)
+
+        loss = criterion_class(outputshr, targets)
+        test_loss += loss.item()
+        prec1, prec5 = accuracy(outputshr.data, targets.data, topk=(1, 5))
+        top1 += prec1
+        top5 += prec5
+
+        prec1sr, prec5sr = accuracy(outputssr.data, targets.data, topk=(1, 5))
+        top1sr += prec1sr
+        top5sr += prec5sr
+
+        if epoch == (opt.epoch-1):
+            # PR 数据
+            score_tmp = clhr  # (batchsize, nclass)
+            score_list.extend(score_tmp.detach().cpu().numpy())
+            label_list.extend(train_label.cpu().numpy())
+            score_array = np.array(score_list)
+
+            # 统计 混淆矩阵数据
+            _, predicted = torch.max(clhr.data, 1)
+            for j in range(len(train_label)):
+                cate_i = train_label[j]
+                pre_i = predicted[j]
+                conf_mat[cate_i, pre_i] += 1
+
+    if epoch == (opt.epoch - 1):
+        # 统计 混淆矩阵
+        for i in range(opt.num_classes):
+            tp[i] = conf_mat[i, i]
+
+            fn[i] = conf_mat[i, :].sum() - tp[i]
+
+            fp[i] = conf_mat[:, i].sum() - tp[i]
+
+            tn[i] = conf_mat.sum() - tp[i] - fp[i] - fn[i]
+
+        ###  保存混淆矩阵
+        Recall = tp/(tp+fn)
+        aa = [d for d in os.listdir(train_path) if os.path.isdir(os.path.join(train_path, d))]
+        with open(save + '/conf_mat_val.csv', 'a')as f:
+            f.write(str(Recall))
+            f.write(str(aa))
+            np.savetxt(f, conf_mat, delimiter=',')
+
+        #  画PR图
+        PR_IMAGE(score_array, label_list, opt.num_classes, save, 'val')
+
+    print('[epcho:%d][%d/%d]|Loss: %.3f '
+          % (epoch, iter, len(test_loader),test_loss / (iter + 1)))
+    print ('test_hr_Top1: %.3f%%|test_hr_Top5: %.3f%%' % (100 * top1 / (iter+1), 100 * top5 / (iter+1)))
+    print ('test_sr_Top1: %.3f%%|test_sr_Top5: %.3f%%' % (100 * top1sr / (iter+1), 100 * top5sr / (iter+1)))
+
+    acc = 100 * top1sr / len(test_loader)
+    acc_list = [acc_list[0], acc_list[1], acc_list[2], 100 * top1 / (iter + 1), 100 * top1sr / (iter + 1)]
+    logger.append(acc_list)
+    writer.add_scalars('data/testacc', {'HRacc': top1 / len(test_loader),
+                                    'SRacc': top1sr / len(test_loader)}, epoch)
+    writer.add_scalars('data/testTopacc', {'Top1': top1/ len(test_loader),
+                                       'Top5': top5/ len(test_loader),
+                                       'Top1sr': top1sr/ len(test_loader),
+                                       'Top5sr': top5sr/ len(test_loader)}, epoch)
+    return acc
+
+def save_checkpoint(state, checkpoint,is_best,name=''):
+    filepath = os.path.join(save, 'last_'+name+'.pth.tar')
+    torch.save(state, filepath)
+    if is_best:
+        shutil.copyfile(filepath, os.path.join(save, 'best_'+name+'.pth.tar'))
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        correct_k = correct[:k].view(-1).float().sum(0)
+        res.append(correct_k.mul_(1.0 / batch_size))
+
+    return res
+
+###### Training ######
+for epoch in range(opt.epoch, opt.n_epochs):
+
+    scale = opt.scale
+    optimizer = utility.make_optimizer(opt, srmodel)
+    dual_optimizers = utility.make_dual_optimizer(opt, dual_models)
+    scheduler = utility.make_scheduler(opt, optimizer)
+    dual_scheduler = utility.make_dual_scheduler(opt, dual_optimizers)
+    error_last = 1e8
+    Gen_loss=0.0
+    cif_loss = 0
+    classification_loss = 0
+    every_pres = 0
+    top1 = 0
+    top5 = 0
+    top1sr = 0
+    top5sr = 0
+    score_list = []  # 存储预测得分
+    label_list = []  # 存储真实标签
+    tp = np.zeros([opt.num_classes], dtype=int)    ####    混淆矩阵
+    fp = np.zeros([opt.num_classes], dtype=int)    ####    tp  fn
+    tn = np.zeros([opt.num_classes], dtype=int)    ####    fp  tn
+    fn = np.zeros([opt.num_classes], dtype=int)
+    conf_mat = np.zeros([opt.num_classes, opt.num_classes],dtype=int)  # 混淆矩阵
+
+    srmodel.train()
+    classifmodel.eval()
+
+    print(time.strftime("%Y-%m-%d-%H:%M:%S"))
+
+    for iter, traindata in enumerate(train_loader):
+        ###### 删除T换任务
+        if os.path.isdir(T)!= 1 :
+            break
+        imhr, imlr_112, imlr_56, imlr_28, train_label = traindata
+        imhr, imlr_112, imlr_56, imlr_28, train_label = imhr.cuda(), imlr_112.cuda(), imlr_56.cuda(), imlr_28.cuda(), train_label.cuda()
+
+        ###### training srmodel######
+        optimizer.zero_grad()
+
+        for i in range(len(dual_optimizers)):
+            dual_optimizers[i].zero_grad()
+
+        # forward
+        sr = srmodel(imlr_28)
+        sr2lr = []
+        for i in range(len(dual_models)):
+            sr2lr_i = dual_models[i](sr[i - len(dual_models)])
+            sr2lr.append(sr2lr_i)
+
+        # compute primary loss
+        # sr[3]-->224  sr[2]-->112 sr[1]-->56  sr[0]-->28
+        loss_primary = loss_function(sr[3], imhr)
+        loss_primary += loss_function(sr[2], imlr_112)
+        loss_primary += loss_function(sr[1], imlr_56)
+        loss_primary += loss_function(sr[0], imlr_28)
+
+        # compute dual loss
+        # sr2lr[2]-->112 sr2lr[1]-->56  sr2lr[0]-->28
+        loss_dual = loss_function(sr2lr[0], imlr_28)
+        loss_dual += loss_function(sr2lr[1], imlr_56)
+        loss_dual += loss_function(sr2lr[2], imlr_112)
+
+        # compute sr loss
+        loss = loss_primary + 1*opt.dual_weight * loss_dual
+
+        src, c1sr, c2sr, c3sr = classifmodel(x=sr[3], y=2)
+        clhr, c1hr, c2hr, c3hr = classifmodel(x=imhr.detach(), y=2)
+        classloss1 = criterion_G(c1sr, c1hr)
+        classloss2 = criterion_G(c2sr, c2hr)
+        classloss3 = criterion_G(c3sr, c3hr)
+
+        ## 112尺寸的sr图片上采样至224,输入到分类网络
+        lr112= sr[2]
+        lr112=torch.cat([up(lr112[i, :, :, :].squeeze(0).cpu()).unsqueeze(0).cuda() for i in range(len(lr112))], 0)
+        src_112, c1sr_112, c2sr_112, c3sr_112 = classifmodel(x=lr112, y=2)
+        classloss4 = criterion_G(c1sr_112, c1hr)
+        classloss5 = criterion_G(c2sr_112, c2hr)
+        classloss6 = criterion_G(c3sr_112, c3hr)
+
+
+        ## 56尺寸的sr图片上采样至224,输入到分类网络
+        lr56 = sr[1]
+        lr56 = torch.cat([up(lr56[i, :, :, :].squeeze(0).cpu()).unsqueeze(0).cuda() for i in range(len(lr56))], 0)
+        src_56, c1sr_56, c2sr_56, c3sr_56 = classifmodel(x=lr56, y=2)
+        classloss7 = criterion_G(c1sr_56, c1hr)
+        classloss8 = criterion_G(c2sr_56, c2hr)
+        classloss9 = criterion_G(c3sr_56, c3hr)
+
+        ## 112尺寸的sr图片直接输入到分类网络
+        c1sr, c2sr, c3sr, c4sr, c5sr = classifmodel(x=sr[2], y=10)
+        c1hr, c2hr, c3hr, c4hr, c5hr = classifmodel(x=imlr_112.detach(), y=10)
+        classloss10 = criterion_G(c1sr, c1hr)
+        classloss11 = criterion_G(c2sr, c2hr)
+        classloss12 = criterion_G(c3sr, c3hr)
+        classloss13 = criterion_G(c4sr, c4hr)
+        classloss14 = criterion_G(c5sr, c5hr)
+
+        ## 56尺寸的sr图片直接输入到分类网络
+        c1sr, c2sr, c3sr, c4sr, c5sr = classifmodel(x=sr[1], y=10)
+        c1hr, c2hr, c3hr, c4hr, c5hr = classifmodel(x=imlr_56.detach(), y=10)
+        classloss15 = criterion_G(c1sr, c1hr)
+        classloss16 = criterion_G(c2sr, c2hr)
+        classloss17 = criterion_G(c3sr, c3hr)
+        classloss18 = criterion_G(c4sr, c4hr)
+        classloss19 = criterion_G(c5sr, c5hr)
+
+        classloss= classloss1+classloss2+classloss3\
+                   + 0.5 * (classloss4+classloss5+classloss6+classloss7+classloss8+classloss9)\
+                   + 0.1 * (classloss10+classloss11+classloss12+classloss13+classloss14+classloss15+classloss16+classloss17+classloss18+classloss19)
+
+        class_loss = criterion_class(src, train_label)+0 * criterion_class(src_112, train_label)+0 * criterion_class(src_56, train_label)
+        Gloss=0.01*loss+1*classloss+1*class_loss
+
+        Gen_loss+=Gloss
+
+        if Gloss.item() < opt.skip_threshold * error_last:
+            Gloss.backward()
+            optimizer.step()
+            for i in range(len(dual_optimizers)):
+                dual_optimizers[i].step()
+        else:
+            print('Skip this batch {}! (Loss: {})'.format(
+                iter + 1, loss.item()
+            ))
+
+        # measure accuracy and record loss
+        prec1, prec5 = accuracy(clhr.data, train_label.data, topk=(1, 5))
+        top1 += prec1
+        top5 += prec5
+
+        prec1sr, prec5sr = accuracy(src.data, train_label.data, topk=(1, 5))
+        top1sr += prec1sr
+        top5sr += prec5sr
+
+        if epoch == (opt.epoch-1):
+            # PR 数据
+            score_tmp = clhr  # (batchsize, nclass)
+            score_list.extend(score_tmp.detach().cpu().numpy())
+            label_list.extend(train_label.cpu().numpy())
+            score_array = np.array(score_list)
+
+            # 统计 混淆矩阵数据
+            _, predicted = torch.max(clhr.data, 1)
+            for j in range(len(train_label)):
+                cate_i = train_label[j]
+                pre_i = predicted[j]
+                conf_mat[cate_i, pre_i] += 1
+
+    if epoch == (opt.epoch - 1):
+        # 统计 混淆矩阵
+        for i in range(opt.num_classes):
+            tp[i] = conf_mat[i, i]
+
+            fn[i] = conf_mat[i, :].sum() - tp[i]
+
+            fp[i] = conf_mat[:, i].sum() - tp[i]
+
+            tn[i] = conf_mat.sum() - tp[i] - fp[i] - fn[i]
+
+        ###  保存混淆矩阵
+        Recall = tp/(tp+fn)
+        aa = [d for d in os.listdir(train_path) if os.path.isdir(os.path.join(train_path, d))]
+        with open(save + '/conf_mat.csv_train', 'a')as f:
+            f.write(str(Recall))
+            f.write(str(aa))
+            np.savetxt(f, conf_mat, delimiter=',')
+
+        #  画PR图
+        PR_IMAGE(score_array, label_list, opt.num_classes, save, 'train')
+
+    print('[Totle loss] SRmodelloss:%.3f|'%(Gen_loss/(iter+1)))
+    print('train_hr_Top1: %.3f%%|train_hr_Top5: %.3f%%'%(100*top1/(iter+1),100*top5/(iter+1)))
+    print('train_sr_Top1: %.3f%%|train_sr_Top5: %.3f%%' % (100*top1sr/(iter+1),100*top5sr/(iter+1)))
+
+    #### 准确率列表，保存到result.csv
+    acc_list = [epoch, 100 * top1 / (iter + 1), 100 * top1sr / (iter + 1)]
+
+    writer.add_histogram('zz/x', Gen_loss / len(train_loader), epoch)
+    writer.add_scalar('data/Gloss', Gen_loss / len(train_loader), epoch)
+    writer.add_scalars('data/acc', {'HRacc': top1/len(train_loader),
+                                             'SRacc': top1sr/len(train_loader)}, epoch)
+    writer.add_scalars('data/Topacc', {'Top1': top1/len(train_loader),
+                                             'Top5': top5/len(train_loader),
+                                             'Top1sr': top1sr/len(train_loader),
+                                             'Top5sr':top5sr/len(train_loader)}, epoch)
+    writer.add_text('zz/text', 'zz: this is epoch ' + str(epoch), epoch)
+
+    with torch.no_grad():
+        acc = test(epoch, acc_list)
+    is_best = acc > best_acc
+    best_acc = max(acc, best_acc)
+    # Update learning rates
+    save_checkpoint(srmodel.state_dict(), opt.checkpoint, is_best, name=opt.name+'sr')
+    save_checkpoint(classifmodel.state_dict(), opt.checkpoint, is_best, name=opt.name+'cl')
+    save_checkpoint(dual_models[0].state_dict(), opt.checkpoint, is_best, name=opt.name+'_dual_0')
+    save_checkpoint(dual_models[1].state_dict(), opt.checkpoint, is_best, name=opt.name+'_dual_1')
+    save_checkpoint(dual_models[2].state_dict(), opt.checkpoint, is_best, name=opt.name+'_dual_2')
+    if is_best:
+        a = epoch
+    print(a, best_acc)
+
+    ###### 删除T换任务
+    if os.path.isdir(T) != 1:
+        break
+writer.close()
+###################################
